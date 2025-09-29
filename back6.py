@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 from openai import OpenAI  # NEW SDK
 
-# ---- Render keepalive (opens a tiny HTTP server on $PORT) ----
+# ---- Render keepalive (tiny HTTP server on $PORT) ----
 import os, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -22,6 +22,9 @@ class _Ping(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
+    def do_HEAD(self):  # <-- add this
+        self.send_response(200)
+        self.end_headers()
 
 def _keepalive():
     port = int(os.environ.get("PORT", "10000"))
@@ -29,6 +32,8 @@ def _keepalive():
     server.serve_forever()
 
 threading.Thread(target=_keepalive, daemon=True).start()
+# ------------------------------------------------------
+
 # --------------------------------------------------------------
 
 
@@ -194,4 +199,5 @@ async def on_ready():
 # ----------------- Run -----------------
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
+
 
