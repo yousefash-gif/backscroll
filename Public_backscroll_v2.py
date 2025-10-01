@@ -34,9 +34,6 @@ def _keepalive():
 threading.Thread(target=_keepalive, daemon=True).start()
 # ------------------------------------------------------
 
-# --------------------------------------------------------------
-
-
 # ----------------- Config -----------------
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -48,6 +45,7 @@ if not DISCORD_TOKEN or not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)  # NEW client
 
 MAX_BACKSCROLL = 500
+SUPPORT_LINK = "https://discord.gg/B3tb9nv8"
 
 # ----------------- Discord Setup -----------------
 intents = discord.Intents.default()
@@ -121,7 +119,6 @@ Content rules:
 - If clear topics aren’t present, keep the Topics list very short or omit it.
 """
 
-
     # Use a thread to avoid blocking the event loop (SDK call is sync)
     resp = await asyncio.to_thread(
         client.chat.completions.create,
@@ -155,10 +152,13 @@ async def backscroll(inter: discord.Interaction, count: Optional[int] = 100):
         summary = await summarize_with_ai(formatted)
 
         await inter.followup.send(
-            f"📜 **Summary of the last {len(msgs)} messages:**\n\n{summary}"
+            f"📜 **Summary of recent messages:**\n\n{summary}"
         )
-    except Exception as e:
-        await inter.followup.send(f"❌ Error while summarizing: `{e}`", ephemeral=True)
+    except Exception:
+        await inter.followup.send(
+            f"❌ I couldn’t complete the summary. Need help? Join our support server: {SUPPORT_LINK}",
+            ephemeral=True
+        )
 
 @bot.tree.command(name="backscroll_private", description="Summarize the last N messages and send privately.")
 @app_commands.describe(count="How many messages to fetch (1–800)")
@@ -179,13 +179,16 @@ async def backscroll_private(inter: discord.Interaction, count: Optional[int] = 
 
         try:
             await inter.user.send(
-                f"📬 **Private summary of the last {len(msgs)} messages in #{inter.channel.name}:**\n\n{summary}"
+                f"📬 **Private summary of recent messages in #{inter.channel.name}:**\n\n{summary}"
             )
             await inter.followup.send("✅ Sent you a DM with the summary.", ephemeral=True)
         except discord.Forbidden:
             await inter.followup.send("❌ Could not send you a DM. Please check your privacy settings.", ephemeral=True)
-    except Exception as e:
-        await inter.followup.send(f"❌ Error while summarizing: `{e}`", ephemeral=True)
+    except Exception:
+        await inter.followup.send(
+            f"❌ I couldn’t complete the summary. Need help? Join our support server: {SUPPORT_LINK}",
+            ephemeral=True
+        )
 
 # ----------------- Ready Event -----------------
 @bot.event
@@ -199,4 +202,3 @@ async def on_ready():
 # ----------------- Run -----------------
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
-
