@@ -1,8 +1,12 @@
-# backscroll_bot.py
-# Discord bot with /backscroll and /backscroll_private
+# public_backscroll_v3.py
+# Discord bot with /backscroll and /backscroll_private (+ admin metrics)
 # Summarizes last N messages with AI (OpenAI SDK >= 1.0).
 
 import os
+import io
+import csv
+import time
+import sqlite3
 import asyncio
 from typing import List, Optional
 
@@ -46,6 +50,54 @@ client = OpenAI(api_key=OPENAI_API_KEY)  # NEW client
 
 MAX_BACKSCROLL = 500
 SUPPORT_LINK = "https://discord.gg/B3tb9nv8"
+
+# ---- Admin & DB config ----
+ADMIN_ID = 710963340360417300  # your admin user id
+DB_PATH = os.getenv("METRICS_DB", "metrics.db")
+_db_lock = threading.Lock()
+with sqlite3.connect(DB_PATH) as _conn:
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT,
+            guild_name TEXT,
+            command_name TEXT,
+            ts INTEGER
+        )
+    """)
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS guild_joins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT,
+            guild_name TEXT,
+            owner_id TEXT,
+            joined_at INTEGER
+        )
+    """)
+
+def _now() -> int:
+    return int(time.time())
+
+def log_usage(guild: Optional[discord.Guild], command_name: str) -> None:
+    if not guild:
+        return
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO usage_events (guild_id, guild_name, command_name, ts) VALUES (?,?,?,?)",
+            (str(guild.id), guild.name, command_name, _now()),
+        )
+        conn.commit()
+
+def log_guild_join(guild: discord.Guild) -> None:
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO guild_joins (guild_id, guild_name, owner_id, joined_at) VALUES (?,?,?,?)",
+            (str(guild.id), guild.name, str(guild.owner_id), _now()),
+        )
+        conn.commit()
+
+def is_admin(inter: discord.Interaction) -> bool:
+    return inter.user.id == ADMIN_ID
 
 # ----------------- Discord Setup -----------------
 intents = discord.Intents.default()
@@ -151,6 +203,9 @@ async def backscroll(inter: discord.Interaction, count: Optional[int] = 100):
         formatted = format_messages(msgs)
         summary = await summarize_with_ai(formatted)
 
+        # --- log usage (minimal change) ---
+        log_usage(inter.guild, "backscroll")
+
         await inter.followup.send(
             f"📜 **Summary of recent messages:**\n\n{summary}"
         )
@@ -177,6 +232,9 @@ async def backscroll_private(inter: discord.Interaction, count: Optional[int] = 
         formatted = format_messages(msgs)
         summary = await summarize_with_ai(formatted)
 
+        # --- log usage (minimal change) ---
+        log_usage(inter.guild, "backscroll_private")
+
         try:
             await inter.user.send(
                 f"📬 **Private summary of recent messages in #{inter.channel.name}:**\n\n{summary}"
@@ -190,6 +248,78 @@ async def backscroll_private(inter: discord.Interaction, count: Optional[int] = 
             ephemeral=True
         )
 
+# ----------------- Admin-only Commands -----------------
+@bot.tree.command(name="usage", description="(Admin) Total usage in the last 24h.")
+async def usage(inter: discord.Interaction):
+    if not is_admin(inter):
+        return await inter.response.send_message("❌ Not allowed.", ephemeral=True)
+    since = _now() - 24 * 3600
+    with sqlite3.connect(DB_PATH) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM usage_events WHERE ts > ?", (since,)).fetchone()[0]
+    await inter.response.send_message(f"📊 Usage (last 24h): **{total}**", ephemeral=True)
+
+@bot.tree.command(name="top", description="(Admin) Top 5 servers by usage (last 7d).")
+async def top(inter: discord.Interaction):
+    if not is_admin(inter):
+        return await inter.response.send_message("❌ Not allowed.", ephemeral=True)
+    since = _now() - 7 * 24 * 3600
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT guild_name, COUNT(*) as cnt
+            FROM usage_events
+            WHERE ts > ?
+            GROUP BY guild_id
+            ORDER BY cnt DESC
+            LIMIT 5
+        """, (since,)).fetchall()
+    if not rows:
+        return await inter.response.send_message("No usage in the last 7 days.", ephemeral=True)
+    out = "\n".join([f"{i+1}. {name} — {cnt} uses" for i, (name, cnt) in enumerate(rows)])
+    await inter.response.send_message(f"🏆 Top 5 servers (7d):\n{out}", ephemeral=True)
+
+@bot.tree.command(name="export", description="(Admin) Export usage (last 7d) as CSV.")
+async def export_cmd(inter: discord.Interaction):
+    if not is_admin(inter):
+        return await inter.response.send_message("❌ Not allowed.", ephemeral=True)
+    since = _now() - 7 * 24 * 3600
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT guild_name, command_name, ts FROM usage_events WHERE ts > ? ORDER BY ts DESC",
+            (since,)
+        ).fetchall()
+    if not rows:
+        return await inter.response.send_message("No data to export.", ephemeral=True)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Guild", "Command", "Timestamp"])
+    for r in rows:
+        writer.writerow(r)
+    data = buf.getvalue().encode()
+    file = discord.File(io.BytesIO(data), filename="usage_7d.csv")
+    await inter.response.send_message("📂 Exported usage for the last 7 days:", file=file, ephemeral=True)
+
+@bot.tree.command(name="joins", description="(Admin) Show last N servers the bot joined.")
+@app_commands.describe(n="How many servers to list (default 5)")
+async def joins(inter: discord.Interaction, n: Optional[int] = 5):
+    if not is_admin(inter):
+        return await inter.response.send_message("❌ Not allowed.", ephemeral=True)
+    n = max(1, min(50, n or 5))
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT guild_name, joined_at FROM guild_joins ORDER BY joined_at DESC LIMIT ?",
+            (n,)
+        ).fetchall()
+    if not rows:
+        return await inter.response.send_message("No join records yet.", ephemeral=True)
+    out = "\n".join([f"{name} — joined <t:{ts}:R>" for (name, ts) in rows])
+    await inter.response.send_message(f"📥 Last {len(rows)} joins:\n{out}", ephemeral=True)
+
+# ----------------- Events -----------------
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    # log join event for /joins
+    log_guild_join(guild)
+
 # ----------------- Ready Event -----------------
 @bot.event
 async def on_ready():
@@ -197,7 +327,7 @@ async def on_ready():
         await bot.tree.sync()
     except Exception as e:
         print("❌ Sync error:", e)
-    print(f"✅ Logged in as {bot.user} (slash commands: /backscroll, /backscroll_private)")
+    print(f"✅ Logged in as {bot.user} (slash commands: /backscroll, /backscroll_private, /usage, /top, /export, /joins)")
 
 # ----------------- Run -----------------
 if __name__ == "__main__":
