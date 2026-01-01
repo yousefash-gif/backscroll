@@ -1,12 +1,16 @@
-# public_backscroll_v3.py
+# public_backscroll_v5_1.py
 # Discord bot with /backscroll and /backscroll_private (+ admin metrics scoped to 2 guilds)
-# Added: per-user cooldown, per-guild 24h cap, human-readable usage log,
-#        user/channel logging + admin who/whohere,
-#        conditional Topics (only when requested > 100 messages).
+# Added:
+# - per-user cooldown
+# - per-guild 24h cap
+# - human-readable usage log
+# - user/channel logging + admin who/whohere
+# - conditional Topics (only when requested > 100 messages)
 #
-# UPDATE (v3.1):
-# - One-time per-server update notice after deploy
-# - Per-server language mode via /language set <language>
+# NEW IN THIS UPDATE:
+# 1) One-time per-server "bot updated" notice (shows once per server per BOT_VERSION)
+# 2) Per-server language mode via /language set <language>
+#    Summaries are written natively in that language (not "English then translate")
 
 import os
 import io
@@ -34,10 +38,12 @@ class _Ping(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
+
 def _keepalive():
     port = int(os.environ.get("PORT", "10000"))
     server = HTTPServer(("0.0.0.0", port), _Ping)
     server.serve_forever()
+
 threading.Thread(target=_keepalive, daemon=True).start()
 
 # ----------------- Config -----------------
@@ -50,12 +56,12 @@ if not DISCORD_TOKEN or not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-MAX_BACKSCROLL = 700
+MAX_BACKSCROLL = 500
 
-# Change BOT_VERSION whenever you want the one-time update message to appear again in every server.
-BOT_VERSION = "v5"
+# Change this whenever you want the "update notice" to show again in every server.
+BOT_VERSION = "v5.1"
 
-# Leave placeholder, paste real link later
+# Leave placeholder, paste your real support server invite later.
 SUPPORT_LINK = "https://discord.gg/kKSeZU37dy"
 
 ADMIN_ID = 710963340360417300
@@ -76,6 +82,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ----------------- Metrics (SQLite) -----------------
 DB_PATH = "metrics.db"
 _db_lock = threading.Lock()
+
 with sqlite3.connect(DB_PATH) as _conn:
     _conn.execute("""
         CREATE TABLE IF NOT EXISTS usage_events (
@@ -95,7 +102,8 @@ with sqlite3.connect(DB_PATH) as _conn:
             joined_at INTEGER
         )
     """)
-    # ---- lightweight migration: add who/where columns if missing ----
+
+    # Lightweight migration: add who/where columns if missing
     for col in ["user_id TEXT", "user_name TEXT", "channel_id TEXT", "channel_name TEXT"]:
         try:
             _conn.execute(f"ALTER TABLE usage_events ADD COLUMN {col}")
@@ -106,7 +114,7 @@ with sqlite3.connect(DB_PATH) as _conn:
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_guild ON usage_events(guild_id)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_events(user_id)")
 
-    # ---- NEW: per-guild settings (language + one-time update notice) ----
+    # NEW: per-guild settings
     _conn.execute("""
         CREATE TABLE IF NOT EXISTS guild_settings (
             guild_id TEXT PRIMARY KEY,
@@ -116,10 +124,11 @@ with sqlite3.connect(DB_PATH) as _conn:
     """)
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_settings_guild ON guild_settings(guild_id)")
 
-# human-readable usage log
+# Human-readable usage log
 PLAIN_LOG_PATH = "usage.txt"
 
-def _now(): return int(time.time())
+def _now() -> int:
+    return int(time.time())
 
 def _append_plain_log(line: str):
     try:
@@ -145,7 +154,7 @@ def log_usage_inter(inter: discord.Interaction, command_name: str):
         conn.commit()
     _append_plain_log(
         f"[{ts}] {inter.guild.name} ({inter.guild_id}) "
-        f"#{getattr(inter.channel,'name','DM')} — {command_name} by {inter.user.display_name} ({inter.user.id})"
+        f"#{getattr(inter.channel,'name','DM')} | {command_name} by {inter.user.display_name} ({inter.user.id})"
     )
 
 def log_guild_join(guild: discord.Guild):
@@ -170,13 +179,19 @@ def _ensure_guild_settings_row(guild_id: int):
 def get_guild_language(guild_id: int) -> str:
     _ensure_guild_settings_row(guild_id)
     with _db_lock, sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT language FROM guild_settings WHERE guild_id = ?", (str(guild_id),)).fetchone()
+        row = conn.execute(
+            "SELECT language FROM guild_settings WHERE guild_id = ?",
+            (str(guild_id),)
+        ).fetchone()
     return (row[0] or "").strip()
 
 def set_guild_language(guild_id: int, lang: str):
     _ensure_guild_settings_row(guild_id)
     with _db_lock, sqlite3.connect(DB_PATH) as conn:
-        conn.execute("UPDATE guild_settings SET language = ? WHERE guild_id = ?", (lang.strip(), str(guild_id)))
+        conn.execute(
+            "UPDATE guild_settings SET language = ? WHERE guild_id = ?",
+            (lang.strip(), str(guild_id))
+        )
         conn.commit()
 
 def reset_guild_language(guild_id: int):
@@ -203,43 +218,40 @@ def _mark_update_notice_seen(guild_id: int):
 
 async def maybe_send_update_notice(inter: discord.Interaction):
     """
-    Send a one-time per-server update message after this version deploy.
-    Shows once per guild per BOT_VERSION.
+    Send a one-time per-server update message per BOT_VERSION.
+    It tries to post in the channel once. If it cannot, it attempts ephemeral to the invoker.
     """
     if inter.guild is None:
         return
     if _has_seen_update_notice(inter.guild.id):
         return
 
-    # Mark as seen first so concurrent calls do not spam
+    # Mark seen first to prevent double sends if multiple users call at the same time
     _mark_update_notice_seen(inter.guild.id)
 
     msg = (
         "**Backscroll update is live**\n"
-        "• New changes are online.\n"
+        "• The bot is online and updated.\n"
         f"• Want new features or help? Join our support server: {SUPPORT_LINK}\n"
         "• Admins can set language with `/language set arabic`"
     )
 
+    # Try to post publicly
     try:
-        # Try to post it publicly in the channel so the server sees it once
         if inter.channel and hasattr(inter.channel, "send"):
             await inter.channel.send(msg)
-        else:
-            # Fallback to ephemeral if no channel
-            if not inter.response.is_done():
-                await inter.response.send_message(msg, ephemeral=True)
-            else:
-                await inter.followup.send(msg, ephemeral=True)
+            return
     except Exception:
-        # If we cannot send in channel (permissions), do not break the command
-        try:
-            if not inter.response.is_done():
-                await inter.response.send_message(msg, ephemeral=True)
-            else:
-                await inter.followup.send(msg, ephemeral=True)
-        except Exception:
-            pass
+        pass
+
+    # Fallback: send to the user (ephemeral)
+    try:
+        if not inter.response.is_done():
+            await inter.response.send_message(msg, ephemeral=True)
+        else:
+            await inter.followup.send(msg, ephemeral=True)
+    except Exception:
+        pass
 
 # ----------------- Abuse Controls -----------------
 _user_last_used: defaultdict[int, float] = defaultdict(float)
@@ -337,17 +349,16 @@ def normalize_language(inp: str) -> str:
     return LANG_ALIASES.get(key, inp.strip().title())
 
 async def summarize_with_ai(formatted_msgs: str, include_topics: bool, language: str) -> str:
-    # language instruction
-    lang_line = ""
-    lang = (language or "").strip()
-    if lang:
-        lang_line = (
-            f"\nIMPORTANT:\n"
-            f"- Write the entire output in {lang}.\n"
-            f"- Keep the same structure, but translated.\n"
-        )
+    # Your original rules stay the same, we only prepend language rules.
+    lang = (language or "").strip() or "English"
 
-    core_rules = """
+    core_rules = f"""
+Language:
+- Write natively in {lang}.
+- Think and summarize directly in {lang}.
+- Do NOT translate from English.
+- Use natural phrasing as a fluent speaker would.
+
 Summarize the Discord messages for a friend who missed the chat.
 
 Style:
@@ -372,8 +383,6 @@ Length & format:
 - One short paragraph (2–6 simple sentences).
 - Prefer shorter over longer, but if there is content to talk about make it longer.
 """
-
-    core_rules += lang_line
 
     if include_topics:
         core_rules += """
@@ -409,7 +418,7 @@ Output only:
     )
     return resp.choices[0].message.content.strip()
 
-# ----------------- NEW: Language commands -----------------
+# ----------------- Language commands -----------------
 language_group = app_commands.Group(name="language", description="Set the bot language for this server.")
 
 @language_group.command(name="set", description="Set the language for this server (example: arabic, russian).")
@@ -420,10 +429,8 @@ async def language_set(inter: discord.Interaction, language: str):
 
     lang = normalize_language(language)
     set_guild_language(inter.guild.id, lang)
-
     await inter.response.send_message(
-        f"✅ Server language set to **{lang}**.\n"
-        "Next summaries will be written in that language.",
+        f"✅ Server language set to **{lang}**.\nNext summaries will be written in that language.",
         ephemeral=True
     )
 
@@ -434,7 +441,7 @@ async def language_current(inter: discord.Interaction):
 
     lang = get_guild_language(inter.guild.id)
     if not lang:
-        return await inter.response.send_message("🌍 Server language is **default (auto/English)**.", ephemeral=True)
+        return await inter.response.send_message("🌍 Server language is **default (English)**.", ephemeral=True)
     await inter.response.send_message(f"🌍 Server language is set to **{lang}**.", ephemeral=True)
 
 @language_group.command(name="reset", description="Reset this server language back to default.")
@@ -443,7 +450,7 @@ async def language_reset(inter: discord.Interaction):
         return await inter.response.send_message("❌ Use this in a server.", ephemeral=True)
 
     reset_guild_language(inter.guild.id)
-    await inter.response.send_message("✅ Server language reset to **default (auto/English)**.", ephemeral=True)
+    await inter.response.send_message("✅ Server language reset to **default (English)**.", ephemeral=True)
 
 bot.tree.add_command(language_group)
 
@@ -456,7 +463,7 @@ async def backscroll(inter: discord.Interaction, count: Optional[int] = 100):
     if err:
         return await inter.response.send_message(err, ephemeral=True)
 
-    # One-time update message per server per version
+    # One-time update notice per server per version
     await maybe_send_update_notice(inter)
 
     # Passed checks: set cooldown, then proceed
@@ -492,7 +499,7 @@ async def backscroll_private(inter: discord.Interaction, count: Optional[int] = 
     if err:
         return await inter.response.send_message(err, ephemeral=True)
 
-    # One-time update message per server per version
+    # One-time update notice per server per version
     await maybe_send_update_notice(inter)
 
     _bump_cooldown(inter.user.id)
@@ -553,7 +560,7 @@ for g in CONTROL_GUILDS:
             """, (since,)).fetchall()
         if not rows:
             return await inter.response.send_message("No usage in last 7d.", ephemeral=True)
-        out = "\n".join([f"{i+1}. {name} — {cnt} uses" for i, (name, cnt) in enumerate(rows)])
+        out = "\n".join([f"{i+1}. {name} | {cnt} uses" for i, (name, cnt) in enumerate(rows)])
         await inter.response.send_message(f"🏆 Top 5 servers (7d):\n{out}", ephemeral=True)
 
     @bot.tree.command(name="export", description="(Admin) Export usage (last 7d) as CSV.", guild=g)
@@ -588,7 +595,7 @@ for g in CONTROL_GUILDS:
             ).fetchall()
         if not rows:
             return await inter.response.send_message("No join records.", ephemeral=True)
-        out = "\n".join([f"{name} — joined <t:{ts}:R>" for name, ts in rows])
+        out = "\n".join([f"{name} | joined <t:{ts}:R>" for name, ts in rows])
         await inter.response.send_message(f"📥 Last {len(rows)} joins:\n{out}", ephemeral=True)
 
     @bot.tree.command(name="who", description="(Admin) Who used the bot in the last 24h (top 10).", guild=g)
@@ -607,7 +614,7 @@ for g in CONTROL_GUILDS:
             """, (since,)).fetchall()
         if not rows:
             return await inter.response.send_message("No usage in last 24h.", ephemeral=True)
-        out = "\n".join([f"{i+1}. {name} — {cnt} calls (ID `{uid}`)"
+        out = "\n".join([f"{i+1}. {name} | {cnt} calls (ID `{uid}`)"
                          for i, (name, uid, cnt) in enumerate(rows)])
         await inter.response.send_message(f"🕵️ Top users (24h):\n{out}", ephemeral=True)
 
@@ -627,7 +634,7 @@ for g in CONTROL_GUILDS:
             """, (str(inter.guild.id),)).fetchall()
         if not rows:
             return await inter.response.send_message("No records for this guild.", ephemeral=True)
-        out = "\n".join([f"<t:{ts}:R> — {user} (`{uid}`) ran **/{cmd}** in #{chan}"
+        out = "\n".join([f"<t:{ts}:R> | {user} (`{uid}`) ran **/{cmd}** in #{chan}"
                          for (user, uid, cmd, chan, ts) in rows])
         await inter.response.send_message(f"📜 Last 10 calls in **{inter.guild.name}**:\n{out}", ephemeral=True)
 
@@ -635,7 +642,6 @@ for g in CONTROL_GUILDS:
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     log_guild_join(guild)
-    # ensure row exists early
     _ensure_guild_settings_row(guild.id)
 
 @bot.event
