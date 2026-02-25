@@ -1,16 +1,5 @@
 # public_backscroll_v5_1.py
 # Discord bot with /backscroll and /backscroll_private (+ admin metrics scoped to 2 guilds)
-# Added:
-# - per-user cooldown
-# - per-guild 24h cap
-# - human-readable usage log
-# - user/channel logging + admin who/whohere
-# - conditional Topics (only when requested > 100 messages)
-#
-# NEW IN THIS UPDATE:
-# 1) One-time per-server "bot updated" notice (shows once per server per BOT_VERSION)
-# 2) Per-server language mode via /language set <language>
-#    Summaries are written natively in that language (not "English then translate")
 
 import os
 import io
@@ -21,6 +10,8 @@ import asyncio
 import threading
 from typing import List, Optional
 from collections import defaultdict
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -61,14 +52,35 @@ MAX_BACKSCROLL = 500
 # Change this whenever you want the "update notice" to show again in every server.
 BOT_VERSION = "v5.1"
 
-# Leave placeholder, paste your real support server invite later.
+# Support server invite (already inside your code)
 SUPPORT_LINK = "https://discord.gg/kKSeZU37dy"
 
 ADMIN_ID = 710963340360417300
 
 # Rate & quota controls
 COOLDOWN_SECONDS = 60               # per-user cooldown
-MAX_DAILY_PER_GUILD = 30            # per-guild 24h cap across both commands
+MAX_DAILY_PER_GUILD = 30            # per-guild 24h cap across both commands (kept)
+MAX_DAILY_PER_USER = 10             # NEW: per-user per-day cap across both commands
+
+# Concurrency protection to reduce request spikes (helps avoid global rate limits)
+MAX_CONCURRENT_SUMMARIES_GLOBAL = 3  # keep small
+_global_summary_sem = asyncio.Semaphore(MAX_CONCURRENT_SUMMARIES_GLOBAL)
+_guild_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+# Timezone for "per day"
+LOCAL_TZ = ZoneInfo("America/New_York")
+
+# Privileged users (unlimited)
+try:
+    from privileged_users import PRIVILEGED_USER_IDS
+except Exception:
+    PRIVILEGED_USER_IDS = set()
+
+def is_privileged(user_id: int) -> bool:
+    try:
+        return int(user_id) in set(PRIVILEGED_USER_IDS)
+    except Exception:
+        return False
 
 # Scope admin commands ONLY to these 2 guilds
 CONTROL_GUILDS = [discord.Object(id=782572577260175420), discord.Object(id=912451366839013396)]
@@ -114,7 +126,7 @@ with sqlite3.connect(DB_PATH) as _conn:
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_guild ON usage_events(guild_id)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_events(user_id)")
 
-    # NEW: per-guild settings
+    # Per-guild settings
     _conn.execute("""
         CREATE TABLE IF NOT EXISTS guild_settings (
             guild_id TEXT PRIMARY KEY,
@@ -124,11 +136,26 @@ with sqlite3.connect(DB_PATH) as _conn:
     """)
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_settings_guild ON guild_settings(guild_id)")
 
+    # NEW: per-user daily usage
+    _conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_daily_usage (
+            user_id TEXT NOT NULL,
+            day_key TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, day_key)
+        )
+    """)
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_user_daily_day ON user_daily_usage(day_key)")
+
 # Human-readable usage log
 PLAIN_LOG_PATH = "usage.txt"
 
 def _now() -> int:
     return int(time.time())
+
+def _day_key_now() -> str:
+    # Example: "2026-02-25" in America/New_York
+    return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
 
 def _append_plain_log(line: str):
     try:
@@ -170,7 +197,7 @@ def log_guild_join(guild: discord.Guild):
 def is_admin(inter: discord.Interaction) -> bool:
     return inter.user.id == ADMIN_ID
 
-# ----------------- NEW: Settings helpers -----------------
+# ----------------- Settings helpers -----------------
 def _ensure_guild_settings_row(guild_id: int):
     with _db_lock, sqlite3.connect(DB_PATH) as conn:
         conn.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (str(guild_id),))
@@ -219,7 +246,6 @@ def _mark_update_notice_seen(guild_id: int):
 async def maybe_send_update_notice(inter: discord.Interaction):
     """
     Send a one-time per-server update message per BOT_VERSION.
-    It tries to post in the channel once. If it cannot, it attempts ephemeral to the invoker.
     """
     if inter.guild is None:
         return
@@ -230,10 +256,11 @@ async def maybe_send_update_notice(inter: discord.Interaction):
     _mark_update_notice_seen(inter.guild.id)
 
     msg = (
-        "**Backscroll update is live**\n"
-        "• The bot is online and updated.\n"
-        f"• Want new features or help? Join our support server: {SUPPORT_LINK}\n"
-        "• Admins can set language with `/language set arabic`"
+        "**Backscroll Update**\n"
+        "We’re back online. We had a short disruption due to Discord API global rate limits. Thanks for your patience.\n\n"
+        "**New usage limits (effective now)**\n"
+        f"To keep service reliable as we scale, Backscroll is now limited to **{MAX_DAILY_PER_USER} backscrolls per user per day**. "
+        f"**Premium users** get unlimited usage. For updates and support: {SUPPORT_LINK}"
     )
 
     # Try to post publicly
@@ -252,6 +279,27 @@ async def maybe_send_update_notice(inter: discord.Interaction):
             await inter.followup.send(msg, ephemeral=True)
     except Exception:
         pass
+
+# ----------------- Daily usage helpers -----------------
+def _get_user_daily_used(user_id: int, day_key: str) -> int:
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT used FROM user_daily_usage WHERE user_id = ? AND day_key = ?",
+            (str(user_id), day_key)
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+def _inc_user_daily_used(user_id: int, day_key: str, delta: int = 1):
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO user_daily_usage (user_id, day_key, used) VALUES (?,?,0)",
+            (str(user_id), day_key)
+        )
+        conn.execute(
+            "UPDATE user_daily_usage SET used = used + ? WHERE user_id = ? AND day_key = ?",
+            (int(delta), str(user_id), day_key)
+        )
+        conn.commit()
 
 # ----------------- Abuse Controls -----------------
 _user_last_used: defaultdict[int, float] = defaultdict(float)
@@ -275,19 +323,30 @@ def _guild_usage_24h(guild_id: int) -> int:
 
 async def _preflight_checks(inter: discord.Interaction) -> Optional[str]:
     """Return an error message string if not allowed; otherwise None."""
+    if inter.guild is None:
+        return "❌ This command must be used in a server channel."
+
     rem = _cooldown_remaining(inter.user.id)
     if rem > 0:
         return f"⏳ Cooldown: please wait **{rem}s** before using this again."
 
-    if inter.guild is None:
-        return "❌ This command must be used in a server channel."
-
-    used = _guild_usage_24h(inter.guild.id)
-    if used >= MAX_DAILY_PER_GUILD:
+    # Per-guild 24h cap (kept from your code)
+    used_guild = _guild_usage_24h(inter.guild.id)
+    if used_guild >= MAX_DAILY_PER_GUILD:
         return (
             f"🚫 This server reached its 24-hour limit of **{MAX_DAILY_PER_GUILD}** summaries. "
             f"Try again later or contact support: {SUPPORT_LINK}"
         )
+
+    # NEW: per-user daily cap (unless privileged)
+    if not is_privileged(inter.user.id):
+        day_key = _day_key_now()
+        used_user = _get_user_daily_used(inter.user.id, day_key)
+        if used_user >= MAX_DAILY_PER_USER:
+            return (
+                f"🚫 Daily limit reached (**{MAX_DAILY_PER_USER}/day**). "
+                f"Premium users get unlimited usage. Support: {SUPPORT_LINK}"
+            )
 
     return None
 
@@ -315,28 +374,22 @@ def format_messages(msgs: List[discord.Message]) -> str:
 LANG_ALIASES = {
     "english": "English",
     "en": "English",
-
     "arabic": "Arabic",
     "ar": "Arabic",
     "العربية": "Arabic",
     "عربي": "Arabic",
-
     "russian": "Russian",
     "ru": "Russian",
     "русский": "Russian",
-
     "spanish": "Spanish",
     "es": "Spanish",
     "español": "Spanish",
-
     "french": "French",
     "fr": "French",
     "français": "French",
-
     "german": "German",
     "de": "German",
     "deutsch": "German",
-
     "turkish": "Turkish",
     "tr": "Turkish",
     "türkçe": "Turkish",
@@ -349,7 +402,6 @@ def normalize_language(inp: str) -> str:
     return LANG_ALIASES.get(key, inp.strip().title())
 
 async def summarize_with_ai(formatted_msgs: str, include_topics: bool, language: str) -> str:
-    # Your original rules stay the same, we only prepend language rules.
     lang = (language or "").strip() or "English"
 
     core_rules = f"""
@@ -458,39 +510,44 @@ bot.tree.add_command(language_group)
 @bot.tree.command(name="backscroll", description="Summarize the last N messages in this channel.")
 @app_commands.describe(count="How many messages to fetch (1–800)")
 async def backscroll(inter: discord.Interaction, count: Optional[int] = 100):
-    # Preflight before we defer: cheap checks, zero token spend
     err = await _preflight_checks(inter)
     if err:
         return await inter.response.send_message(err, ephemeral=True)
 
-    # One-time update notice per server per version
     await maybe_send_update_notice(inter)
 
-    # Passed checks: set cooldown, then proceed
     _bump_cooldown(inter.user.id)
-
     await inter.response.defer(thinking=True)
+
     if not isinstance(inter.channel, discord.TextChannel):
         return await inter.followup.send("❌ This command can only be used in text channels.", ephemeral=True)
 
     requested = count or 100
     count = max(1, min(MAX_BACKSCROLL, requested))
 
-    try:
-        msgs = await fetch_messages(inter.channel, count)
-        if not msgs:
-            return await inter.followup.send("No messages found.", ephemeral=True)
+    # Concurrency limits (global + per guild)
+    guild_lock = _guild_locks[int(inter.guild.id)] if inter.guild else asyncio.Lock()
 
-        formatted = format_messages(msgs)
-        include_topics = requested > 100
+    async with _global_summary_sem:
+        async with guild_lock:
+            try:
+                msgs = await fetch_messages(inter.channel, count)
+                if not msgs:
+                    return await inter.followup.send("No messages found.", ephemeral=True)
 
-        lang = get_guild_language(inter.guild.id) if inter.guild else ""
-        summary = await summarize_with_ai(formatted, include_topics, lang)
+                formatted = format_messages(msgs)
+                include_topics = requested > 100
+                lang = get_guild_language(inter.guild.id) if inter.guild else ""
+                summary = await summarize_with_ai(formatted, include_topics, lang)
 
-        log_usage_inter(inter, "backscroll")
-        await inter.followup.send(f"📜 **Summary of the last {requested} messages:**\n\n{summary}")
-    except Exception:
-        await inter.followup.send(f"❌ I couldn’t complete the summary. Need help? {SUPPORT_LINK}", ephemeral=True)
+                # Count usage (per-user daily) AFTER success
+                if not is_privileged(inter.user.id):
+                    _inc_user_daily_used(inter.user.id, _day_key_now(), 1)
+
+                log_usage_inter(inter, "backscroll")
+                await inter.followup.send(f"📜 **Summary of the last {requested} messages:**\n\n{summary}")
+            except Exception:
+                await inter.followup.send(f"❌ I couldn’t complete the summary. Need help? {SUPPORT_LINK}", ephemeral=True)
 
 @bot.tree.command(name="backscroll_private", description="Summarize the last N messages and send privately.")
 @app_commands.describe(count="How many messages to fetch (1–800)")
@@ -499,39 +556,44 @@ async def backscroll_private(inter: discord.Interaction, count: Optional[int] = 
     if err:
         return await inter.response.send_message(err, ephemeral=True)
 
-    # One-time update notice per server per version
     await maybe_send_update_notice(inter)
 
     _bump_cooldown(inter.user.id)
-
     await inter.response.defer(thinking=True, ephemeral=True)
+
     if not isinstance(inter.channel, discord.TextChannel):
         return await inter.followup.send("❌ This command can only be used in text channels.", ephemeral=True)
 
     requested = count or 100
     count = max(1, min(MAX_BACKSCROLL, requested))
 
-    try:
-        msgs = await fetch_messages(inter.channel, count)
-        if not msgs:
-            return await inter.followup.send("No messages found.", ephemeral=True)
+    guild_lock = _guild_locks[int(inter.guild.id)] if inter.guild else asyncio.Lock()
 
-        formatted = format_messages(msgs)
-        include_topics = requested > 100
+    async with _global_summary_sem:
+        async with guild_lock:
+            try:
+                msgs = await fetch_messages(inter.channel, count)
+                if not msgs:
+                    return await inter.followup.send("No messages found.", ephemeral=True)
 
-        lang = get_guild_language(inter.guild.id) if inter.guild else ""
-        summary = await summarize_with_ai(formatted, include_topics, lang)
+                formatted = format_messages(msgs)
+                include_topics = requested > 100
+                lang = get_guild_language(inter.guild.id) if inter.guild else ""
+                summary = await summarize_with_ai(formatted, include_topics, lang)
 
-        log_usage_inter(inter, "backscroll_private")
-        try:
-            await inter.user.send(
-                f"📬 **Private summary of the last {requested} messages in #{inter.channel.name}:**\n\n{summary}"
-            )
-            await inter.followup.send("✅ Sent you a DM with the summary.", ephemeral=True)
-        except discord.Forbidden:
-            await inter.followup.send("❌ Could not DM you.", ephemeral=True)
-    except Exception:
-        await inter.followup.send(f"❌ I couldn’t complete the summary. Need help? {SUPPORT_LINK}", ephemeral=True)
+                if not is_privileged(inter.user.id):
+                    _inc_user_daily_used(inter.user.id, _day_key_now(), 1)
+
+                log_usage_inter(inter, "backscroll_private")
+                try:
+                    await inter.user.send(
+                        f"📬 **Private summary of the last {requested} messages in #{inter.channel.name}:**\n\n{summary}"
+                    )
+                    await inter.followup.send("✅ Sent you a DM with the summary.", ephemeral=True)
+                except discord.Forbidden:
+                    await inter.followup.send("❌ Could not DM you.", ephemeral=True)
+            except Exception:
+                await inter.followup.send(f"❌ I couldn’t complete the summary. Need help? {SUPPORT_LINK}", ephemeral=True)
 
 # ----------------- Admin-only Commands (scoped to CONTROL_GUILDS and ADMIN_ID) -----------------
 for g in CONTROL_GUILDS:
